@@ -9,9 +9,13 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
+	"runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type measurementStats struct {
@@ -21,42 +25,198 @@ type measurementStats struct {
 	count int64
 }
 
+type fileChunk struct {
+	start int64
+	end   int64
+}
+
 func main() {
 	inputPath := flag.String("input", "measurements.txt", "path to the measurements file")
 	generate := flag.Bool("generate", false, "generate a measurements file instead of computing results")
 	total := flag.Int("total", defaultTotalMeasurements, "number of rows to generate when using -generate")
 	chunkSize := flag.Int("chunk", defaultChunkSize, "rows per chunk when generating data")
+	workers := flag.Int("workers", runtime.NumCPU(), "number of worker goroutines when processing measurements")
 	flag.Parse()
 
 	if *generate {
+		timerDone := newRunTimer()
 		if err := generateMeasurements(*inputPath, *total, *chunkSize); err != nil {
 			log.Fatalf("generate failed: %v", err)
 		}
-		fmt.Printf("generated %d measurements into %s\n", *total, *inputPath)
+		wall, cpu, haveCPU := timerDone()
+		reportRunMetrics(fmt.Sprintf("generated %d measurements into %s", *total, *inputPath), wall, cpu, haveCPU)
 		return
 	}
 
-	stats, err := calculate(*inputPath)
+	timerDone := newRunTimer()
+	stats, err := calculate(*inputPath, *workers)
 	if err != nil {
 		log.Fatalf("processing failed: %v", err)
 	}
 
 	fmt.Println(formatStats(stats))
+	wall, cpu, haveCPU := timerDone()
+	reportRunMetrics("processing completed", wall, cpu, haveCPU)
 }
 
-func calculate(path string) (map[string]*measurementStats, error) {
+func calculate(path string, workers int) (map[string]measurementStats, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	reader := bufio.NewReaderSize(file, 1<<20)
-	statsByStation := make(map[string]*measurementStats, 4096)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
 
-	var partial []byte
+	size := info.Size()
+	if size == 0 {
+		return make(map[string]measurementStats), nil
+	}
+
+	if workers < 1 {
+		workers = 1
+	}
+	if int64(workers) > size {
+		workers = int(size)
+		if workers == 0 {
+			workers = 1
+		}
+	}
+
+	chunks, err := splitIntoChunks(file, size, workers)
+	if err != nil {
+		return nil, err
+	}
+
+	type chunkResult struct {
+		data map[string]measurementStats
+		err  error
+	}
+
+	results := make(chan chunkResult, len(chunks))
+	var wg sync.WaitGroup
+	for _, chunk := range chunks {
+		wg.Add(1)
+		go func(c fileChunk) {
+			defer wg.Done()
+			data, err := processChunk(file, c.start, c.end)
+			results <- chunkResult{data: data, err: err}
+		}(chunk)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	merged := make(map[string]measurementStats, 4096)
+	var firstErr error
+
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		mergeStats(merged, res.data)
+	}
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	return merged, nil
+}
+
+func splitIntoChunks(file *os.File, size int64, workers int) ([]fileChunk, error) {
+	if workers < 1 {
+		workers = 1
+	}
+	chunkSize := size / int64(workers)
+	if chunkSize == 0 {
+		chunkSize = size
+	}
+
+	chunks := make([]fileChunk, 0, workers)
+	var start int64
+	for i := 0; i < workers && start < size; i++ {
+		end := start + chunkSize
+		if i == workers-1 || end >= size {
+			end = size
+		} else {
+			var err error
+			end, err = advanceToNextNewline(file, end, size)
+			if err != nil {
+				return nil, err
+			}
+			if end > size {
+				end = size
+			}
+		}
+		if end < start {
+			end = start
+		}
+		chunks = append(chunks, fileChunk{start: start, end: end})
+		start = end
+	}
+
+	if len(chunks) == 0 && size > 0 {
+		return []fileChunk{{start: 0, end: size}}, nil
+	}
+
+	return chunks, nil
+}
+
+func advanceToNextNewline(file *os.File, offset int64, size int64) (int64, error) {
+	if offset >= size {
+		return size, nil
+	}
+
+	buf := make([]byte, 64*1024)
+	current := offset
 	for {
-		line, err := reader.ReadSlice('\n')
+		if current >= size {
+			return size, nil
+		}
+		toRead := int64(len(buf))
+		if remaining := size - current; remaining < toRead {
+			toRead = remaining
+		}
+		n, err := file.ReadAt(buf[:toRead], current)
+		if n == 0 {
+			if err == io.EOF {
+				return size, nil
+			}
+			return size, err
+		}
+		for i := 0; i < n; i++ {
+			if buf[i] == '\n' {
+				return current + int64(i+1), nil
+			}
+		}
+		current += int64(n)
+		if err == io.EOF {
+			return size, nil
+		}
+	}
+}
+
+func processChunk(file *os.File, start, end int64) (map[string]measurementStats, error) {
+	if end <= start {
+		return make(map[string]measurementStats), nil
+	}
+
+	reader := io.NewSectionReader(file, start, end-start)
+	bufReader := bufio.NewReaderSize(reader, 1<<20)
+	stats := make(map[string]measurementStats, 512)
+	var partial []byte
+
+	for {
+		line, err := bufReader.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
 			partial = append(partial, line...)
 			continue
@@ -67,8 +227,16 @@ func calculate(path string) (map[string]*measurementStats, error) {
 			partial = partial[:0]
 		}
 
-		if len(line) == 0 && errors.Is(err, io.EOF) {
-			break
+		if len(line) == 0 {
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if len(line) > 0 && line[len(line)-1] == '\n' {
@@ -96,9 +264,9 @@ func calculate(path string) (map[string]*measurementStats, error) {
 			return nil, parseErr
 		}
 
-		stat := statsByStation[station]
-		if stat == nil {
-			statsByStation[station] = &measurementStats{
+		stat := stats[station]
+		if stat.count == 0 {
+			stats[station] = measurementStats{
 				min:   tempValue,
 				max:   tempValue,
 				sum:   int64(tempValue),
@@ -113,6 +281,7 @@ func calculate(path string) (map[string]*measurementStats, error) {
 			}
 			stat.sum += int64(tempValue)
 			stat.count++
+			stats[station] = stat
 		}
 
 		if err == io.EOF {
@@ -123,7 +292,26 @@ func calculate(path string) (map[string]*measurementStats, error) {
 		}
 	}
 
-	return statsByStation, nil
+	return stats, nil
+}
+
+func mergeStats(dst map[string]measurementStats, src map[string]measurementStats) {
+	for station, stat := range src {
+		existing, ok := dst[station]
+		if !ok || existing.count == 0 {
+			dst[station] = stat
+			continue
+		}
+		if stat.min < existing.min {
+			existing.min = stat.min
+		}
+		if stat.max > existing.max {
+			existing.max = stat.max
+		}
+		existing.sum += stat.sum
+		existing.count += stat.count
+		dst[station] = existing
+	}
 }
 
 func parseTemperature(value []byte) (int32, error) {
@@ -172,7 +360,7 @@ func parseTemperature(value []byte) (int32, error) {
 	return sign * accum, nil
 }
 
-func formatStats(stats map[string]*measurementStats) string {
+func formatStats(stats map[string]measurementStats) string {
 	keys := make([]string, 0, len(stats))
 	for k := range stats {
 		keys = append(keys, k)
@@ -226,4 +414,58 @@ func bytesIndexByte(data []byte, target byte) int {
 		}
 	}
 	return -1
+}
+
+func newRunTimer() func() (time.Duration, time.Duration, bool) {
+	startWall := time.Now()
+	startCPU, haveCPU := readProcessCPUTime()
+	return func() (time.Duration, time.Duration, bool) {
+		wall := time.Since(startWall)
+		if !haveCPU {
+			return wall, 0, false
+		}
+		endCPU, endOK := readProcessCPUTime()
+		if !endOK {
+			return wall, 0, false
+		}
+		return wall, endCPU - startCPU, true
+	}
+}
+
+func readProcessCPUTime() (time.Duration, bool) {
+	metricNames := []string{
+		"/process/cpu:seconds",
+		"/cpu/classes/total:cpu-seconds",
+	}
+	var samples [1]metrics.Sample
+	for _, name := range metricNames {
+		samples[0].Name = name
+		metrics.Read(samples[:])
+		val := samples[0].Value
+		switch val.Kind() {
+		case metrics.KindFloat64:
+			secs := val.Float64()
+			if math.IsNaN(secs) || math.IsInf(secs, 0) {
+				continue
+			}
+			return time.Duration(secs * float64(time.Second)), true
+		case metrics.KindUint64:
+			secs := float64(val.Uint64())
+			return time.Duration(secs * float64(time.Second)), true
+		}
+	}
+	return 0, false
+}
+
+func reportRunMetrics(prefix string, wall time.Duration, cpu time.Duration, haveCPU bool) {
+	if haveCPU {
+		if wall > 0 {
+			cpuPercent := float64(cpu) / float64(wall) * 100
+			fmt.Fprintf(os.Stderr, "%s in %s (CPU %s, %.2f%% of wall time)\n", prefix, wall, cpu, cpuPercent)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "%s in %s (CPU %s)\n", prefix, wall, cpu)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s in %s\n", prefix, wall)
 }
