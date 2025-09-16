@@ -79,10 +79,12 @@ func main() {
 	}()
 
 	totalChunks := (totalMeasurements + chunkSize - 1) / chunkSize
-	for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
-		jobs <- chunkIndex
-	}
-	close(jobs)
+	go func() {
+		for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
+			jobs <- chunkIndex
+		}
+		close(jobs)
+	}()
 
 	for chunk := range chunks {
 		if _, err := writer.Write(chunk); err != nil {
