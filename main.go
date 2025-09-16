@@ -29,6 +29,11 @@ type fileChunk struct {
 	end   int
 }
 
+type chunkGroup struct {
+	start int
+	end   int
+}
+
 func main() {
 	inputPath := flag.String("input", "measurements.txt", "path to the measurements file")
 	generate := flag.Bool("generate", false, "generate a measurements file instead of computing results")
@@ -92,26 +97,70 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > len(mapped) {
+	if workers > len(mapped) && len(mapped) > 0 {
 		workers = len(mapped)
 	}
 
-	chunks := splitIntoChunks(mapped, workers)
+	chunkTarget := workers * 8
+	chunks := splitIntoChunks(mapped, chunkTarget)
+	if len(chunks) == 0 {
+		return make(map[string]measurementStats), nil
+	}
+
+	groups := buildChunkGroups(chunks, workers)
+	initialCount := workers
+	if len(groups) < initialCount {
+		initialCount = len(groups)
+	}
+
+	stealCount := 0
+	if len(groups) > initialCount {
+		stealCount = len(groups) - initialCount
+	}
+	stealCh := make(chan chunkGroup, stealCount)
+	if stealCount > 0 {
+		for _, grp := range groups[initialCount:] {
+			stealCh <- grp
+		}
+	}
+	close(stealCh)
 
 	type chunkResult struct {
 		data map[string]measurementStats
 		err  error
 	}
 
-	results := make(chan chunkResult, len(chunks))
+	results := make(chan chunkResult, workers)
 	var wg sync.WaitGroup
-	for _, chunk := range chunks {
+
+	for workerID := 0; workerID < workers; workerID++ {
 		wg.Add(1)
-		go func(c fileChunk) {
+		var initial chunkGroup
+		if workerID < len(groups) {
+			initial = groups[workerID]
+		}
+		go func(initial chunkGroup) {
 			defer wg.Done()
-			data, err := processChunk(mapped, c.start, c.end)
-			results <- chunkResult{data: data, err: err}
-		}(chunk)
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+
+			local := make(map[string]measurementStats, 512)
+			if initial.end > initial.start {
+				if err := processChunk(local, mapped, initial.start, initial.end); err != nil {
+					results <- chunkResult{err: err}
+					return
+				}
+			}
+
+			for grp := range stealCh {
+				if err := processChunk(local, mapped, grp.start, grp.end); err != nil {
+					results <- chunkResult{err: err}
+					return
+				}
+			}
+
+			results <- chunkResult{data: local}
+		}(initial)
 	}
 
 	go func() {
@@ -129,7 +178,9 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 			}
 			continue
 		}
-		mergeStats(merged, res.data)
+		if res.data != nil {
+			mergeStats(merged, res.data)
+		}
 	}
 
 	if firstErr != nil {
@@ -139,39 +190,43 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 	return merged, nil
 }
 
-func splitIntoChunks(data []byte, workers int) []fileChunk {
+func splitIntoChunks(data []byte, desired int) []fileChunk {
 	size := len(data)
-	if workers < 1 {
-		workers = 1
+	if desired < 1 {
+		desired = 1
 	}
-	if workers > size {
-		workers = size
+	if desired > size && size > 0 {
+		desired = size
 	}
-	if workers == 0 {
+	if desired == 0 {
 		return nil
 	}
 
-	chunkSize := size / workers
+	chunkSize := size / desired
 	if chunkSize == 0 {
-		chunkSize = size
+		chunkSize = 1
 	}
 
-	chunks := make([]fileChunk, 0, workers)
+	chunks := make([]fileChunk, 0, desired)
 	start := 0
-	for i := 0; i < workers && start < size; i++ {
+	for i := 0; i < desired && start < size; i++ {
 		end := start + chunkSize
-		if i == workers-1 || end >= size {
+		if end > size {
 			end = size
-		} else {
+		}
+		if end <= start {
+			end = start + 1
+			if end > size {
+				end = size
+			}
+		}
+		if end < size {
 			for end < size && data[end-1] != '\n' {
 				end++
 			}
 			if end > size {
 				end = size
 			}
-		}
-		if end < start {
-			end = start
 		}
 		chunks = append(chunks, fileChunk{start: start, end: end})
 		start = end
@@ -184,12 +239,37 @@ func splitIntoChunks(data []byte, workers int) []fileChunk {
 	return chunks
 }
 
-func processChunk(data []byte, start, end int) (map[string]measurementStats, error) {
-	if end <= start {
-		return make(map[string]measurementStats), nil
+func buildChunkGroups(chunks []fileChunk, workers int) []chunkGroup {
+	if len(chunks) == 0 {
+		return nil
+	}
+	groups := make([]chunkGroup, 0, len(chunks))
+	if workers < 1 {
+		workers = 1
+	}
+	groupSize := (len(chunks) + workers - 1) / workers
+	if groupSize < 1 {
+		groupSize = 1
 	}
 
-	stats := make(map[string]measurementStats, 512)
+	for i := 0; i < len(chunks); i += groupSize {
+		endIndex := i + groupSize
+		if endIndex > len(chunks) {
+			endIndex = len(chunks)
+		}
+		start := chunks[i].start
+		end := chunks[endIndex-1].end
+		groups = append(groups, chunkGroup{start: start, end: end})
+	}
+
+	return groups
+}
+
+func processChunk(dst map[string]measurementStats, data []byte, start, end int) error {
+	if end <= start {
+		return nil
+	}
+
 	pos := start
 	for pos < end {
 		lineStart := pos
@@ -207,18 +287,18 @@ func processChunk(data []byte, start, end int) (map[string]measurementStats, err
 
 		sep := bytesIndexByte(line, ';')
 		if sep == -1 {
-			return nil, fmt.Errorf("invalid line (missing ';'): %q", string(line))
+			return fmt.Errorf("invalid line (missing ';'): %q", string(line))
 		}
 
 		station := string(line[:sep])
 		tempValue, parseErr := parseTemperature(line[sep+1:])
 		if parseErr != nil {
-			return nil, parseErr
+			return parseErr
 		}
 
-		stat := stats[station]
+		stat := dst[station]
 		if stat.count == 0 {
-			stats[station] = measurementStats{
+			dst[station] = measurementStats{
 				min:   tempValue,
 				max:   tempValue,
 				sum:   int64(tempValue),
@@ -233,11 +313,11 @@ func processChunk(data []byte, start, end int) (map[string]measurementStats, err
 			}
 			stat.sum += int64(tempValue)
 			stat.count++
-			stats[station] = stat
+			dst[station] = stat
 		}
 	}
 
-	return stats, nil
+	return nil
 }
 
 func mergeStats(dst map[string]measurementStats, src map[string]measurementStats) {
