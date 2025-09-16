@@ -34,8 +34,6 @@ type chunkGroup struct {
 	end   int
 }
 
-var stationNames = newStringInterner(4096)
-
 func main() {
 	inputPath := flag.String("input", "measurements.txt", "path to the measurements file")
 	generate := flag.Bool("generate", false, "generate a measurements file instead of computing results")
@@ -302,7 +300,7 @@ func processChunk(dst map[string]measurementStats, data []byte, start, end int) 
 			return fmt.Errorf("invalid line (missing ';'): %q", string(data[lineStart:lineEnd]))
 		}
 
-		station := stationNames.intern(data[lineStart:sepIndex])
+		station := string(data[lineStart:sepIndex])
 		tempValue, parseErr := parseTemperature(data[sepIndex+1 : lineEnd])
 		if parseErr != nil {
 			return parseErr
@@ -443,76 +441,6 @@ func roundAverage(sum int64, count int64) int32 {
 	}
 	rounded := math.Round(float64(sum) / float64(count))
 	return int32(rounded)
-}
-
-type stringInterner struct {
-	buckets []internBucket
-}
-
-type internBucket struct {
-	sync.Mutex
-	entries []internEntry
-}
-
-type internEntry struct {
-	hash  uint64
-	value string
-}
-
-func newStringInterner(targetBuckets int) *stringInterner {
-	if targetBuckets < 1 {
-		targetBuckets = 1
-	}
-	size := 1
-	for size < targetBuckets {
-		size <<= 1
-	}
-	return &stringInterner{buckets: make([]internBucket, size)}
-}
-
-func (s *stringInterner) intern(data []byte) string {
-	if len(data) == 0 {
-		return ""
-	}
-	hash := hashBytes(data)
-	index := int(hash & uint64(len(s.buckets)-1))
-	bucket := &s.buckets[index]
-	bucket.Lock()
-	for _, entry := range bucket.entries {
-		if entry.hash == hash && stringEqualsBytes(entry.value, data) {
-			bucket.Unlock()
-			return entry.value
-		}
-	}
-	value := string(data)
-	bucket.entries = append(bucket.entries, internEntry{hash: hash, value: value})
-	bucket.Unlock()
-	return value
-}
-
-func hashBytes(data []byte) uint64 {
-	const (
-		offset64 = 1469598103934665603
-		prime64  = 1099511628211
-	)
-	h := uint64(offset64)
-	for _, b := range data {
-		h ^= uint64(b)
-		h *= prime64
-	}
-	return h
-}
-
-func stringEqualsBytes(str string, data []byte) bool {
-	if len(str) != len(data) {
-		return false
-	}
-	for i := range data {
-		if str[i] != data[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func newRunTimer() func() (time.Duration, time.Duration, bool) {
