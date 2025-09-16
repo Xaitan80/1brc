@@ -11,23 +11,30 @@ import (
 )
 
 const (
-	totalMeasurements = 1_000_000_000
-	chunkSize         = 100_000
+	defaultTotalMeasurements = 1_000_000_000
+	defaultChunkSize         = 100_000
 )
 
 var stations = []string{"Stockholm", "Berlin", "Madrid", "Paris", "Oslo"}
 
-func main() {
-	file, err := os.Create("measurements.txt")
+func generateMeasurements(path string, total int, chunkSize int) (err error) {
+	if chunkSize <= 0 {
+		chunkSize = defaultChunkSize
+	}
+	if total <= 0 {
+		total = defaultTotalMeasurements
+	}
+
+	file, err := os.Create(path)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer file.Close()
 
-	writer := bufio.NewWriterSize(file, 1<<20) // keep disk writes large
+	writer := bufio.NewWriterSize(file, 1<<20)
 	defer func() {
-		if err := writer.Flush(); err != nil {
-			panic(err)
+		if flushErr := writer.Flush(); err == nil && flushErr != nil {
+			err = flushErr
 		}
 	}()
 
@@ -49,7 +56,7 @@ func main() {
 
 			for chunkIndex := range jobs {
 				start := chunkIndex * chunkSize
-				remaining := totalMeasurements - start
+				remaining := total - start
 				count := chunkSize
 				if remaining < chunkSize {
 					count = remaining
@@ -63,7 +70,7 @@ func main() {
 					station := localStations[rnd.Intn(len(localStations))]
 					buf = append(buf, station...)
 					buf = append(buf, ';')
-					temp := -20 + rnd.Float64()*60 // mellan -20 och +40 grader
+					temp := -20 + rnd.Float64()*60
 					buf = strconv.AppendFloat(buf, temp, 'f', 1, 64)
 					buf = append(buf, '\n')
 				}
@@ -78,7 +85,7 @@ func main() {
 		close(chunks)
 	}()
 
-	totalChunks := (totalMeasurements + chunkSize - 1) / chunkSize
+	totalChunks := (total + chunkSize - 1) / chunkSize
 	go func() {
 		for chunkIndex := 0; chunkIndex < totalChunks; chunkIndex++ {
 			jobs <- chunkIndex
@@ -87,8 +94,10 @@ func main() {
 	}()
 
 	for chunk := range chunks {
-		if _, err := writer.Write(chunk); err != nil {
-			panic(err)
+		if _, err = writer.Write(chunk); err != nil {
+			return err
 		}
 	}
+
+	return nil
 }
