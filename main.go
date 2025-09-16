@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
@@ -15,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,8 +25,8 @@ type measurementStats struct {
 }
 
 type fileChunk struct {
-	start int64
-	end   int64
+	start int
+	end   int
 }
 
 func main() {
@@ -37,6 +36,10 @@ func main() {
 	chunkSize := flag.Int("chunk", defaultChunkSize, "rows per chunk when generating data")
 	workers := flag.Int("workers", runtime.NumCPU(), "number of worker goroutines when processing measurements")
 	flag.Parse()
+
+	if *workers > 0 && runtime.GOMAXPROCS(0) < *workers {
+		runtime.GOMAXPROCS(*workers)
+	}
 
 	if *generate {
 		timerDone := newRunTimer()
@@ -76,20 +79,24 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 		return make(map[string]measurementStats), nil
 	}
 
+	if size > int64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("file too large to map on this platform: %d bytes", size)
+	}
+
+	mapped, err := syscall.Mmap(int(file.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("mmap failed: %w", err)
+	}
+	defer syscall.Munmap(mapped)
+
 	if workers < 1 {
 		workers = 1
 	}
-	if int64(workers) > size {
-		workers = int(size)
-		if workers == 0 {
-			workers = 1
-		}
+	if workers > len(mapped) {
+		workers = len(mapped)
 	}
 
-	chunks, err := splitIntoChunks(file, size, workers)
-	if err != nil {
-		return nil, err
-	}
+	chunks := splitIntoChunks(mapped, workers)
 
 	type chunkResult struct {
 		data map[string]measurementStats
@@ -102,7 +109,7 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 		wg.Add(1)
 		go func(c fileChunk) {
 			defer wg.Done()
-			data, err := processChunk(file, c.start, c.end)
+			data, err := processChunk(mapped, c.start, c.end)
 			results <- chunkResult{data: data, err: err}
 		}(chunk)
 	}
@@ -132,26 +139,32 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 	return merged, nil
 }
 
-func splitIntoChunks(file *os.File, size int64, workers int) ([]fileChunk, error) {
+func splitIntoChunks(data []byte, workers int) []fileChunk {
+	size := len(data)
 	if workers < 1 {
 		workers = 1
 	}
-	chunkSize := size / int64(workers)
+	if workers > size {
+		workers = size
+	}
+	if workers == 0 {
+		return nil
+	}
+
+	chunkSize := size / workers
 	if chunkSize == 0 {
 		chunkSize = size
 	}
 
 	chunks := make([]fileChunk, 0, workers)
-	var start int64
+	start := 0
 	for i := 0; i < workers && start < size; i++ {
 		end := start + chunkSize
 		if i == workers-1 || end >= size {
 			end = size
 		} else {
-			var err error
-			end, err = advanceToNextNewline(file, end, size)
-			if err != nil {
-				return nil, err
+			for end < size && data[end-1] != '\n' {
+				end++
 			}
 			if end > size {
 				end = size
@@ -165,91 +178,30 @@ func splitIntoChunks(file *os.File, size int64, workers int) ([]fileChunk, error
 	}
 
 	if len(chunks) == 0 && size > 0 {
-		return []fileChunk{{start: 0, end: size}}, nil
+		return []fileChunk{{start: 0, end: size}}
 	}
 
-	return chunks, nil
+	return chunks
 }
 
-func advanceToNextNewline(file *os.File, offset int64, size int64) (int64, error) {
-	if offset >= size {
-		return size, nil
-	}
-
-	buf := make([]byte, 64*1024)
-	current := offset
-	for {
-		if current >= size {
-			return size, nil
-		}
-		toRead := int64(len(buf))
-		if remaining := size - current; remaining < toRead {
-			toRead = remaining
-		}
-		n, err := file.ReadAt(buf[:toRead], current)
-		if n == 0 {
-			if err == io.EOF {
-				return size, nil
-			}
-			return size, err
-		}
-		for i := 0; i < n; i++ {
-			if buf[i] == '\n' {
-				return current + int64(i+1), nil
-			}
-		}
-		current += int64(n)
-		if err == io.EOF {
-			return size, nil
-		}
-	}
-}
-
-func processChunk(file *os.File, start, end int64) (map[string]measurementStats, error) {
+func processChunk(data []byte, start, end int) (map[string]measurementStats, error) {
 	if end <= start {
 		return make(map[string]measurementStats), nil
 	}
 
-	reader := io.NewSectionReader(file, start, end-start)
-	bufReader := bufio.NewReaderSize(reader, 1<<20)
 	stats := make(map[string]measurementStats, 512)
-	var partial []byte
-
-	for {
-		line, err := bufReader.ReadSlice('\n')
-		if errors.Is(err, bufio.ErrBufferFull) {
-			partial = append(partial, line...)
-			continue
+	pos := start
+	for pos < end {
+		lineStart := pos
+		for pos < end && data[pos] != '\n' {
+			pos++
 		}
-
-		if len(partial) != 0 {
-			line = append(partial, line...)
-			partial = partial[:0]
+		line := data[lineStart:pos]
+		if pos < end {
+			pos++
 		}
 
 		if len(line) == 0 {
-			if err == nil {
-				continue
-			}
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		if len(line) > 0 && line[len(line)-1] == '\n' {
-			line = line[:len(line)-1]
-		}
-
-		if len(line) == 0 {
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return nil, err
-			}
 			continue
 		}
 
@@ -282,13 +234,6 @@ func processChunk(file *os.File, start, end int64) (map[string]measurementStats,
 			stat.sum += int64(tempValue)
 			stat.count++
 			stats[station] = stat
-		}
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
 		}
 	}
 
