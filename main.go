@@ -29,11 +29,6 @@ type fileChunk struct {
 	end   int
 }
 
-type chunkGroup struct {
-	start int
-	end   int
-}
-
 var stationNames = newStringInterner(4096)
 
 func main() {
@@ -109,61 +104,46 @@ func calculate(path string, workers int) (map[string]measurementStats, error) {
 		return make(map[string]measurementStats), nil
 	}
 
-	groups := buildChunkGroups(chunks, workers)
-	initialCount := workers
-	if len(groups) < initialCount {
-		initialCount = len(groups)
-	}
-
-	stealCount := 0
-	if len(groups) > initialCount {
-		stealCount = len(groups) - initialCount
-	}
-	stealCh := make(chan chunkGroup, stealCount)
-	if stealCount > 0 {
-		for _, grp := range groups[initialCount:] {
-			stealCh <- grp
-		}
-	}
-	close(stealCh)
-
 	type chunkResult struct {
 		data map[string]measurementStats
 		err  error
 	}
 
 	results := make(chan chunkResult, workers)
+	chunkCh := make(chan fileChunk, len(chunks))
 	var wg sync.WaitGroup
 
-	for workerID := 0; workerID < workers; workerID++ {
-		wg.Add(1)
-		var initial chunkGroup
-		if workerID < len(groups) {
-			initial = groups[workerID]
-		}
-		go func(initial chunkGroup) {
-			defer wg.Done()
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
-
-			local := make(map[string]measurementStats, 512)
-			if initial.end > initial.start {
-				if err := processChunk(local, mapped, initial.start, initial.end); err != nil {
-					results <- chunkResult{err: err}
-					return
-				}
-			}
-
-			for grp := range stealCh {
-				if err := processChunk(local, mapped, grp.start, grp.end); err != nil {
-					results <- chunkResult{err: err}
-					return
-				}
-			}
-
-			results <- chunkResult{data: local}
-		}(initial)
+	workerCount := workers
+	if workerCount > len(chunks) {
+		workerCount = len(chunks)
 	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			local := make(map[string]measurementStats, 512)
+			for chunk := range chunkCh {
+				if err := processChunk(local, mapped, chunk.start, chunk.end); err != nil {
+					results <- chunkResult{err: err}
+					return
+				}
+			}
+			if len(local) > 0 {
+				results <- chunkResult{data: local}
+			}
+		}()
+	}
+
+	go func() {
+		for _, chunk := range chunks {
+			chunkCh <- chunk
+		}
+		close(chunkCh)
+	}()
 
 	go func() {
 		wg.Wait()
@@ -239,32 +219,6 @@ func splitIntoChunks(data []byte, desired int) []fileChunk {
 	}
 
 	return chunks
-}
-
-func buildChunkGroups(chunks []fileChunk, workers int) []chunkGroup {
-	if len(chunks) == 0 {
-		return nil
-	}
-	groups := make([]chunkGroup, 0, len(chunks))
-	if workers < 1 {
-		workers = 1
-	}
-	groupSize := (len(chunks) + workers - 1) / workers
-	if groupSize < 1 {
-		groupSize = 1
-	}
-
-	for i := 0; i < len(chunks); i += groupSize {
-		endIndex := i + groupSize
-		if endIndex > len(chunks) {
-			endIndex = len(chunks)
-		}
-		start := chunks[i].start
-		end := chunks[endIndex-1].end
-		groups = append(groups, chunkGroup{start: start, end: end})
-	}
-
-	return groups
 }
 
 func processChunk(dst map[string]measurementStats, data []byte, start, end int) error {
